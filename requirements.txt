@@ -1,3 +1,6 @@
+# Azure Functions 运行时（平台自带，这里显式声明）
 azure-functions
+
+# 用来把状态存到 Azure Blob，实例回收也不丢——真正的 Serverless 持久化。
+# 装不上也没关系：state_store 里是延迟导入，缺它会自动回退到本地文件。
 azure-storage-blob
-requests

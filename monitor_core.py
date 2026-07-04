@@ -1,488 +1,411 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-魔方财务云服务器监控核心模块。
+监控核心：魔方财务(ZJMF) API 客户端 + 状态机引擎。
 
-包含：
-- MofangAPI：魔方财务 API 客户端，token 失效（401/403/405/未登录）自动重新登录。
-- MonitorEngine：监控引擎，内置 5 状态机（healthy/suspect/down/rebooting/recovering），
-  检测到关机/异常自动开机（或硬重启）。
-
-该模块不依赖 Azure，可被本地脚本、Azure Functions 等任何入口复用。
+这里不碰任何 Azure / Web 的东西，纯逻辑，方便本地脚本和 Serverless 入口共用。
+只用标准库，别引第三方 http 库——部署到 Serverless 时少一个装不上的理由。
 """
 
 import json
 import time
 import logging
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
-import requests
-
-
-# ========== 状态判定关键词 ==========
-OFF_KEYWORDS = {
-    "off", "poweroff", "power_off", "shutdown", "stopped", "halted", "closed",
-    "关机", "已关机", "关闭",
-}
-ON_KEYWORDS = {
-    "on", "poweron", "power_on", "running", "active", "online",
-    "开机", "运行中", "在线", "已开机",
-}
-# 登录态失效提示（命中任意一个即触发重新登录）
-NOT_LOGGED_IN_KEYWORDS = ("未登录", "未登陆", "请登录", "请重新登录", "登录失效", "登录已失效")
-
-# 5 状态机
-STATE_HEALTHY = "healthy"
-STATE_SUSPECT = "suspect"
-STATE_DOWN = "down"
-STATE_REBOOTING = "rebooting"
-STATE_RECOVERING = "recovering"
+log = logging.getLogger("monitor")
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def now_ts() -> float:
-    return time.time()
+def _http(method, url, headers=None, params=None, json_body=None, timeout=15):
+    """发一个 HTTP 请求，返回 (status_code, text)。
+
+    4xx/5xx 不抛异常，照常返回状态码和正文——调用方要靠状态码判断登录态。
+    只有连不上（DNS/超时/拒绝）才抛 RuntimeError。
+    """
+    if params:
+        sep = "&" if "?" in url else "?"
+        url = url + sep + urllib.parse.urlencode(params)
+
+    data = json.dumps(json_body).encode() if json_body is not None else None
+    req = urllib.request.Request(url, data=data, method=method.upper())
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception:
+            return e.code, ""
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"{method} {url} 请求失败: {e.reason}")
+
+
+# --- 电源状态关键词 ---
+ON_WORDS = ("on", "poweron", "power_on", "running", "active", "online",
+            "开机", "运行中", "在线", "已开机")
+OFF_WORDS = ("off", "poweroff", "power_off", "shutdown", "stopped", "halted",
+             "closed", "关机", "已关机", "关闭")
+# 命中任意一个就说明登录态没了，需要重新登录
+LOGOUT_HINTS = ("未登录", "未登陆", "请登录", "请重新登录", "登录失效", "登录已失效", "token")
+
+POWER_ON = "on"
+POWER_OFF = "off"
+POWER_UNKNOWN = "unknown"
+
+# 状态机
+HEALTHY = "healthy"
+SUSPECT = "suspect"
+DOWN = "down"
+REBOOTING = "rebooting"
+RECOVERING = "recovering"
 
 
 class MofangAPI:
-    """魔方财务 API 客户端。"""
+    """魔方财务 API 客户端。JWT 失效时自动重登一次再重试。"""
 
-    def __init__(self, base_url: str, account: str, api_key: str, timeout: int = 15):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url, account, api_key, timeout=15):
+        self.base_url = (base_url or "").rstrip("/")
         self.account = account
         self.api_key = api_key
         self.timeout = timeout
-        self.jwt: Optional[str] = None
-        self.jwt_time: float = 0.0
-        self.session = requests.Session()
+        self.jwt = None
+        self.jwt_at = 0.0
 
-    def _url(self, path: str) -> str:
+    def _headers(self):
+        h = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self.jwt:
+            h["authorization"] = f"JWT {self.jwt}"
+        return h
+
+    def _call(self, method, path, params=None, json_body=None, allow_relogin=True):
         if not path.startswith("/"):
             path = "/" + path
-        return self.base_url + path
+        code, text = _http(method, self.base_url + path, self._headers(),
+                            params, json_body, self.timeout)
 
-    def _headers(self) -> Dict[str, str]:
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        if self.jwt:
-            headers["authorization"] = f"JWT {self.jwt}"
-        return headers
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: Optional[dict] = None,
-        json_body: Optional[dict] = None,
-        retry_login: bool = True,
-    ) -> Any:
-        url = self._url(path)
-        resp = self.session.request(
-            method=method,
-            url=url,
-            headers=self._headers(),
-            params=params,
-            json=json_body,
-            timeout=self.timeout,
-        )
-
-        # token 失效的几种情况，统一触发自动重新登录：
-        # 1) HTTP 401 / 403：未授权
-        # 2) HTTP 405：登录态失效后接口常返回该状态
-        # 3) 响应正文包含“未登录”等提示
-        body_text = resp.text or ""
-        not_logged_in = any(kw in body_text for kw in NOT_LOGGED_IN_KEYWORDS)
-
-        if (resp.status_code in (401, 403, 405) or not_logged_in) and retry_login:
-            logging.warning(
-                "检测到登录态失效（HTTP %s%s），重新登录后重试：%s %s",
-                resp.status_code,
-                "，含未登录提示" if not_logged_in else "",
-                method, path,
-            )
+        # 登录态失效有好几种表现：401/403、有时 405，或者正文里带“未登录”
+        logged_out = any(w in text for w in LOGOUT_HINTS)
+        if allow_relogin and (code in (401, 403, 405) or logged_out):
+            log.warning("登录态失效 (HTTP %s)，重新登录后重试 %s %s", code, method, path)
             self.login()
-            return self._request(
-                method, path, params=params, json_body=json_body, retry_login=False
-            )
+            return self._call(method, path, params, json_body, allow_relogin=False)
 
         try:
-            data = resp.json()
-        except Exception:
-            raise RuntimeError(
-                f"接口返回非 JSON：{method} {path}, HTTP {resp.status_code}, "
-                f"body={resp.text[:500]}"
-            )
+            data = json.loads(text) if text.strip() else {}
+        except ValueError:
+            raise RuntimeError(f"接口返回的不是 JSON: {method} {path} HTTP {code} -> {text[:300]}")
 
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"接口 HTTP 错误：{method} {path}, HTTP {resp.status_code}, response={data}"
-            )
+        if code >= 400:
+            raise RuntimeError(f"接口报错: {method} {path} HTTP {code} -> {data}")
         return data
 
     @staticmethod
-    def _unwrap(data: Any) -> Any:
+    def unwrap(data):
+        """魔方的返回常包一层 data/result，剥掉方便取值。"""
         if isinstance(data, dict):
             for key in ("data", "result"):
-                if key in data and isinstance(data[key], (dict, list)):
-                    return data[key]
+                inner = data.get(key)
+                if isinstance(inner, (dict, list)):
+                    return inner
         return data
 
-    def login(self) -> str:
-        """POST /v1/login_api，成功返回 jwt。"""
-        data = self._request(
-            "POST",
-            "/v1/login_api",
-            json_body={"account": self.account, "password": self.api_key},
-            retry_login=False,
-        )
-        raw = self._unwrap(data)
-        jwt = raw.get("jwt") if isinstance(raw, dict) else None
-        if not jwt and isinstance(data, dict):
-            jwt = data.get("jwt")
+    def login(self):
+        data = self._call("POST", "/v1/login_api",
+                          json_body={"account": self.account, "password": self.api_key},
+                          allow_relogin=False)
+        inner = self.unwrap(data)
+        jwt = (inner.get("jwt") if isinstance(inner, dict) else None) \
+            or (data.get("jwt") if isinstance(data, dict) else None)
         if not jwt:
-            raise RuntimeError(f"登录成功但未找到 jwt，返回内容：{data}")
-        self.jwt = jwt
-        self.jwt_time = now_ts()
-        logging.info("登录成功，已获取 JWT")
+            raise RuntimeError(f"登录没拿到 jwt，返回: {data}")
+        self.jwt, self.jwt_at = jwt, time.time()
+        log.info("登录成功")
         return jwt
 
-    def ensure_login(self, max_age: int = 6000):
-        """JWT 缺失或超过 max_age 秒（默认约 100 分钟）时提前重新登录。"""
-        if not self.jwt or (now_ts() - self.jwt_time) > max_age:
+    def ensure_login(self, max_age=6000):
+        """JWT 缺失或快过期（默认 100 分钟）就提前刷一次，省得每个请求都撞 401。"""
+        if not self.jwt or time.time() - self.jwt_at > max_age:
             self.login()
 
-    def list_hosts(self) -> List[Dict[str, Any]]:
-        """获取产品/主机列表（用于自动发现）。"""
-        hosts: List[Dict[str, Any]] = []
-        # 优先尝试 /v1/hosts，其次回退 /v1/tickets/page
-        for path, kw in (("/v1/hosts", {"page": 1, "limit": 100}), ("/v1/tickets/page", None)):
+    def list_hosts(self):
+        """拉主机列表，用于自动发现。不同版本字段不一样，挨个 key 试。"""
+        for path, params in (("/v1/hosts", {"page": 1, "limit": 100}),
+                             ("/v1/tickets/page", None)):
             try:
-                data = self._request("GET", path, params=kw)
+                inner = self.unwrap(self._call("GET", path, params=params))
             except Exception as e:
-                logging.debug("列表接口 %s 调用失败：%s", path, e)
+                log.debug("列表接口 %s 失败: %s", path, e)
                 continue
-            raw = self._unwrap(data)
-            if isinstance(raw, dict):
+            if isinstance(inner, list):
+                return inner
+            if isinstance(inner, dict):
                 for key in ("host", "_host", "list", "data"):
-                    if isinstance(raw.get(key), list):
-                        hosts = raw[key]
-                        break
-            elif isinstance(raw, list):
-                hosts = raw
-            if hosts:
-                break
-        return hosts
+                    if isinstance(inner.get(key), list):
+                        return inner[key]
+        return []
 
-    def get_host_power_status(self, host_id: int) -> Dict[str, Any]:
-        """GET /v1/hosts/:id/module/status?type=host。"""
-        data = self._request(
-            "GET", f"/v1/hosts/{host_id}/module/status", params={"type": "host"}
-        )
+    def power_status(self, host_id):
+        data = self._call("GET", f"/v1/hosts/{host_id}/module/status",
+                          params={"type": "host"})
         return data if isinstance(data, dict) else {"raw": data}
 
-    def power_on(self, host_id: int) -> Dict[str, Any]:
-        """PUT /v1/hosts/:id/module/on 开机。"""
-        return self._request("PUT", f"/v1/hosts/{host_id}/module/on")
+    def power_on(self, host_id):
+        return self._call("PUT", f"/v1/hosts/{host_id}/module/on")
 
-    def hard_reboot(self, host_id: int) -> Dict[str, Any]:
-        """PUT /v1/hosts/:id/module/hard_reboot 硬重启。"""
-        return self._request("PUT", f"/v1/hosts/{host_id}/module/hard_reboot")
+    def hard_reboot(self, host_id):
+        return self._call("PUT", f"/v1/hosts/{host_id}/module/hard_reboot")
 
 
-# ========== 状态文本解析 ==========
-def find_status_text(obj: Any) -> str:
-    status_keys = {
-        "status", "power_status", "power", "state", "host_status",
-        "server_status", "desc", "message", "msg",
-    }
-    found: List[str] = []
+def _collect_status_text(obj) -> str:
+    """从任意嵌套结构里把可能表示状态的字段值拼起来。"""
+    keys = {"status", "power_status", "power", "state", "host_status",
+            "server_status", "desc", "message", "msg"}
+    parts = []
 
-    def walk(x: Any):
+    def walk(x):
         if isinstance(x, dict):
             for k, v in x.items():
-                if str(k).lower() in status_keys:
-                    found.append(str(v))
+                if str(k).lower() in keys:
+                    parts.append(str(v))
                 walk(v)
         elif isinstance(x, list):
-            for item in x:
-                walk(item)
+            for i in x:
+                walk(i)
 
     walk(obj)
-    return " ".join(found).strip()
+    return " ".join(parts).strip()
 
 
-def is_power_on(status_response: Dict[str, Any]) -> bool:
-    text = find_status_text(status_response).lower()
+def classify_power(resp) -> str:
+    """把接口返回归类成 on / off / unknown。
+
+    识别不出来（两边关键词都没命中，或者同时命中互相矛盾）就算 unknown，
+    交给上层去决定要不要硬重启。
+    """
+    text = _collect_status_text(resp).lower()
     if not text:
-        text = json.dumps(status_response, ensure_ascii=False).lower()
-    return any(kw.lower() in text for kw in ON_KEYWORDS)
+        text = json.dumps(resp, ensure_ascii=False).lower()
+    on = any(w in text for w in ON_WORDS)
+    off = any(w in text for w in OFF_WORDS)
+    if on and not off:
+        return POWER_ON
+    if off and not on:
+        return POWER_OFF
+    return POWER_UNKNOWN
 
 
-def is_power_off(status_response: Dict[str, Any]) -> bool:
-    text = find_status_text(status_response).lower()
-    if not text:
-        text = json.dumps(status_response, ensure_ascii=False).lower()
-    return any(kw.lower() in text for kw in OFF_KEYWORDS)
-
-
-# ========== 监控引擎 ==========
 class MonitorEngine:
-    """
-    监控引擎：根据配置对每台服务器执行一次检测，推进状态机并在需要时开机/重启。
+    """按配置跑一轮监控：查状态、推状态机、该开机开机、该重启重启。
 
-    config 结构（由 state_store 提供并持久化）：
-    {
-      "provider": {"base_url", "account", "api_key"},
-      "settings": {
-          "suspect_threshold": 3,      # 连续异常多少次判定 down
-          "reboot_cooldown": 600,      # 两次动作最小间隔（秒）
-          "recover_timeout": 300,      # 触发动作后多久没恢复重新判 down
-          "reboot_limit": 5,           # 统计窗口内最大动作次数（0=不限）
-          "reboot_limit_window": "hour", # hour / day
-          "action": "on",             # on=开机 / hard_reboot=硬重启
-          "dry_run": false,
-          "webhook_url": "",
-          "webhook_type": "custom"     # custom / pushplus
-      },
-      "servers": [
-          {"id": "4075", "name": "我的服务器", "ip": "1.2.3.4", "enabled": true}
-      ],
-      "state": { "<id>": {...运行时状态...} },
-      "events": [ {...事件日志...} ]
-    }
+    config 由 state_store 提供并持久化，结构见 README。运行时状态放在
+    config["state"][server_id]，事件日志放 config["events"]。
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config):
         self.config = config
-        self.config.setdefault("servers", [])
-        self.config.setdefault("state", {})
-        self.config.setdefault("events", [])
+        config.setdefault("servers", [])
+        config.setdefault("state", {})
+        config.setdefault("events", [])
         self.settings = config.setdefault("settings", {})
-        prov = config.get("provider", {})
-        self.api = MofangAPI(
-            base_url=prov.get("base_url", "https://www.heyunidc.cn"),
-            account=prov.get("account", ""),
-            api_key=prov.get("api_key", ""),
-        )
+        p = config.get("provider", {})
+        self.api = MofangAPI(p.get("base_url", "https://www.heyunidc.cn"),
+                             p.get("account", ""), p.get("api_key", ""))
 
-    # ---- 设置读取 ----
-    def _s(self, key: str, default):
+    def _get(self, key, default):
         return self.settings.get(key, default)
 
-    def _log_event(self, server_id: str, name: str, level: str, message: str):
-        event = {
-            "time": now_iso(),
-            "server_id": server_id,
-            "name": name,
-            "level": level,
-            "message": message,
-        }
-        self.config["events"].insert(0, event)
-        # 只保留最近 200 条
-        self.config["events"] = self.config["events"][:200]
-        log_fn = {"critical": logging.error, "warning": logging.warning}.get(level, logging.info)
-        log_fn("[%s] %s", name, message)
+    # ---- 事件与通知 ----
+    def _event(self, sid, name, level, message):
+        self.config["events"].insert(0, {
+            "time": now_iso(), "server_id": sid, "name": name,
+            "level": level, "message": message,
+        })
+        del self.config["events"][200:]
+        {"critical": log.error, "warning": log.warning}.get(level, log.info)("[%s] %s", name, message)
         self._notify(level, name, message)
 
-    def _notify(self, level: str, name: str, message: str):
-        url = self._s("webhook_url", "")
+    def _notify(self, level, name, message):
+        url = self._get("webhook_url", "")
         if not url:
             return
-        wtype = self._s("webhook_type", "custom")
         try:
-            if wtype == "pushplus":
-                requests.post(
-                    "https://www.pushplus.plus/send",
-                    json={"token": url, "title": f"服务器监控 - {name}", "content": message},
-                    timeout=10,
-                )
-            else:  # custom
-                requests.post(
-                    url,
-                    json={"level": level, "name": name, "message": message, "time": now_iso()},
-                    timeout=10,
-                )
-        except Exception as e:
-            logging.warning("通知发送失败：%s", e)
-
-    def _reboot_window_seconds(self) -> int:
-        return 86400 if self._s("reboot_limit_window", "hour") == "day" else 3600
-
-    def _count_recent_actions(self, st: Dict[str, Any]) -> int:
-        window = self._reboot_window_seconds()
-        cutoff = now_ts() - window
-        history = [t for t in st.get("action_history", []) if t >= cutoff]
-        st["action_history"] = history
-        return len(history)
-
-    def _do_action(self, server_id: str, name: str, st: Dict[str, Any]) -> bool:
-        """执行开机 / 硬重启，返回是否成功发送。"""
-        if self._s("dry_run", False):
-            self._log_event(server_id, name, "warning", "DRY_RUN 开启，仅模拟不执行动作")
-            return False
-
-        # 冷却检查
-        last = st.get("last_action_ts", 0)
-        cooldown = self._s("reboot_cooldown", 600)
-        if last and (now_ts() - last) < cooldown:
-            self._log_event(server_id, name, "warning",
-                            f"处于冷却期（{cooldown}s），本轮不执行动作")
-            return False
-
-        # 次数上限检查
-        limit = self._s("reboot_limit", 5)
-        if limit and self._count_recent_actions(st) >= limit:
-            self._log_event(server_id, name, "critical",
-                            f"已达动作次数上限（{limit}/{self._s('reboot_limit_window','hour')}），本轮不执行")
-            return False
-
-        action = self._s("action", "on")
-        try:
-            if action == "hard_reboot":
-                result = self.api.hard_reboot(int(server_id))
-                verb = "硬重启"
+            if self._get("webhook_type", "custom") == "pushplus":
+                _http("POST", "https://www.pushplus.plus/send",
+                      json_body={"token": url, "title": f"服务器监控 - {name}",
+                                 "content": message}, timeout=10)
             else:
-                result = self.api.power_on(int(server_id))
-                verb = "开机"
+                _http("POST", url,
+                      json_body={"level": level, "name": name,
+                                 "message": message, "time": now_iso()}, timeout=10)
         except Exception as e:
-            self._log_event(server_id, name, "critical", f"{action} 指令发送失败：{e}")
+            log.warning("通知发送失败: %s", e)
+
+    def _transition(self, st, new, sid, name, reason):
+        old = st.get("state", HEALTHY)
+        if old == new:
+            return
+        level = {DOWN: "critical", REBOOTING: "critical",
+                 RECOVERING: "warning"}.get(new, "info")
+        self._event(sid, name, level, f"{old} → {new}（{reason}）")
+        st["state"] = new
+
+    # ---- 动作次数限制 ----
+    def _recent_actions(self, st):
+        window = 86400 if self._get("reboot_limit_window", "hour") == "day" else 3600
+        cutoff = time.time() - window
+        st["action_history"] = [t for t in st.get("action_history", []) if t >= cutoff]
+        return len(st["action_history"])
+
+    def _resolve_action(self, st):
+        """决定这次该做什么动作。
+
+        - 服务器明确处于关机 → 用配置里的动作（默认开机）。
+        - 状态识别不出来 (unknown) → 一律硬重启，把它从不确定的状态里拽出来。
+        """
+        if st.get("problem") == POWER_UNKNOWN:
+            return "hard_reboot"
+        return self._get("action", "on")
+
+    def _do_action(self, sid, name, st):
+        """执行开机/硬重启，返回是否真的发出了指令。"""
+        if self._get("dry_run", False):
+            self._event(sid, name, "warning", "DRY_RUN 已开启，只报警不动手")
             return False
 
-        # 二次验证提示
-        raw = MofangAPI._unwrap(result)
-        if isinstance(raw, dict) and ("second_verify" in raw or "_second_verify" in raw):
-            self._log_event(server_id, name, "critical",
-                            f"{verb}需要二次验证，脚本无法自动处理：{raw}")
+        cooldown = self._get("reboot_cooldown", 600)
+        last = st.get("last_action_ts", 0)
+        if last and time.time() - last < cooldown:
+            self._event(sid, name, "warning", f"还在 {cooldown}s 冷却期内，这轮先不动")
             return False
 
-        st["last_action_ts"] = now_ts()
-        st.setdefault("action_history", []).append(now_ts())
-        self._log_event(server_id, name, "critical", f"已发送{verb}指令：{result}")
+        limit = self._get("reboot_limit", 5)
+        if limit and self._recent_actions(st) >= limit:
+            self._event(sid, name, "critical",
+                        f"已达动作上限（{limit}/{self._get('reboot_limit_window', 'hour')}），暂停自动操作")
+            return False
+
+        action = self._resolve_action(st)
+        verb = "硬重启" if action == "hard_reboot" else "开机"
+        try:
+            fn = self.api.hard_reboot if action == "hard_reboot" else self.api.power_on
+            result = fn(int(sid))
+        except Exception as e:
+            self._event(sid, name, "critical", f"{verb}指令发送失败: {e}")
+            return False
+
+        inner = MofangAPI.unwrap(result)
+        if isinstance(inner, dict) and ("second_verify" in inner or "_second_verify" in inner):
+            self._event(sid, name, "critical", f"{verb}需要二次验证，脚本处理不了: {inner}")
+            return False
+
+        st["last_action_ts"] = time.time()
+        st.setdefault("action_history", []).append(time.time())
+        self._event(sid, name, "critical", f"已发送{verb}指令: {result}")
         return True
 
-    def _transition(self, st: Dict[str, Any], new_state: str, server_id: str, name: str, reason: str):
-        old = st.get("state", STATE_HEALTHY)
-        if old != new_state:
-            level = {
-                STATE_DOWN: "critical",
-                STATE_REBOOTING: "critical",
-                STATE_RECOVERING: "warning",
-                STATE_HEALTHY: "info",
-                STATE_SUSPECT: "info",
-            }.get(new_state, "info")
-            self._log_event(server_id, name, level, f"{old} → {new_state}（{reason}）")
-        st["state"] = new_state
-
-    def check_server(self, server: Dict[str, Any]):
-        server_id = str(server.get("id", "")).strip()
-        name = server.get("name") or server.get("product_name") or f"host-{server_id}"
-        if not server_id:
+    def check_server(self, server):
+        sid = str(server.get("id", "")).strip()
+        if not sid or not server.get("enabled", True):
             return
-        if not server.get("enabled", True):
-            return
+        name = server.get("name") or server.get("product_name") or f"host-{sid}"
 
-        st = self.config["state"].setdefault(server_id, {
-            "state": STATE_HEALTHY,
-            "fail_count": 0,
-            "last_action_ts": 0,
-            "action_history": [],
+        st = self.config["state"].setdefault(sid, {
+            "state": HEALTHY, "fail_count": 0, "last_action_ts": 0, "action_history": [],
         })
-
-        # 查询状态
-        try:
-            status_resp = self.api.get_host_power_status(int(server_id))
-        except Exception as e:
-            st["last_check"] = now_iso()
-            st["status_text"] = f"查询失败：{e}"
-            st["online"] = None
-            self._log_event(server_id, name, "warning", f"状态查询失败：{e}")
-            return
-
-        status_text = find_status_text(status_resp) or "-"
-        online = is_power_on(status_resp)
-        offline = is_power_off(status_resp)
-        st["last_check"] = now_iso()
-        st["status_text"] = status_text
-        st["online"] = online
-        st["ip"] = server.get("ip", st.get("ip", "-"))
         st["name"] = name
+        st["ip"] = server.get("ip", st.get("ip", "-"))
+        st["last_check"] = now_iso()
 
-        threshold = self._s("suspect_threshold", 3)
-        state = st.get("state", STATE_HEALTHY)
-
-        if online:
-            # 恢复正常
-            st["fail_count"] = 0
-            if state in (STATE_REBOOTING, STATE_RECOVERING, STATE_DOWN, STATE_SUSPECT):
-                self._transition(st, STATE_HEALTHY, server_id, name, "恢复正常")
-            else:
-                st["state"] = STATE_HEALTHY
+        try:
+            resp = self.api.power_status(int(sid))
+        except Exception as e:
+            # 查询本身失败多半是网络/接口问题，不代表机器坏了，只记一笔不升级
+            st["status_text"] = f"查询失败: {e}"
+            st["online"] = None
+            self._event(sid, name, "warning", f"状态查询失败: {e}")
             return
 
-        # 非在线（关机或异常）
-        st["fail_count"] = st.get("fail_count", 0) + 1
+        power = classify_power(resp)
+        st["status_text"] = _collect_status_text(resp) or power
+        st["online"] = True if power == POWER_ON else (False if power == POWER_OFF else None)
 
-        if state == STATE_RECOVERING:
-            # 动作后仍未恢复，检查是否超时
-            recover_timeout = self._s("recover_timeout", 300)
-            if now_ts() - st.get("last_action_ts", 0) > recover_timeout:
-                self._transition(st, STATE_DOWN, server_id, name, "恢复超时")
-                state = STATE_DOWN
+        if power == POWER_ON:
+            st["fail_count"] = 0
+            st["problem"] = None
+            self._transition(st, HEALTHY, sid, name, "恢复正常")
+            st["state"] = HEALTHY
+            return
+
+        # 到这里说明是关机或状态不明，都算异常
+        st["fail_count"] += 1
+        st["problem"] = power  # off / unknown，供 _resolve_action 用
+        state = st.get("state", HEALTHY)
+
+        # 已经在等恢复：给足恢复时间，超时才重新判宕机
+        if state == RECOVERING:
+            if time.time() - st.get("last_action_ts", 0) <= self._get("recover_timeout", 300):
+                return
+            self._transition(st, DOWN, sid, name, "恢复超时，重新处理")
+            state = DOWN
+
+        if state == HEALTHY:
+            reason = "关机" if power == POWER_OFF else "状态未知"
+            self._transition(st, SUSPECT, sid, name, f"检测到异常（{reason}）")
+            state = SUSPECT
+
+        if state == SUSPECT and st["fail_count"] >= self._get("suspect_threshold", 3):
+            self._transition(st, DOWN, sid, name, f"连续 {st['fail_count']} 次异常，确认宕机")
+            state = DOWN
+
+        if state == DOWN:
+            self._transition(st, REBOOTING, sid, name, "开始尝试拉起")
+            if self._do_action(sid, name, st):
+                self._transition(st, RECOVERING, sid, name, "指令已下发，等待恢复")
             else:
-                return  # 等待恢复中
+                st["state"] = DOWN  # 没动成，下一轮再来
 
-        if state == STATE_HEALTHY:
-            self._transition(st, STATE_SUSPECT, server_id, name, "检测到异常")
-            state = STATE_SUSPECT
-
-        if state == STATE_SUSPECT and st["fail_count"] >= threshold:
-            self._transition(st, STATE_DOWN, server_id, name, f"连续 {st['fail_count']} 次异常确认宕机")
-            state = STATE_DOWN
-
-        if state == STATE_DOWN:
-            self._transition(st, STATE_REBOOTING, server_id, name,
-                             "触发开机/重启" if not self._s("dry_run", False) else "触发（DRY_RUN）")
-            ok = self._do_action(server_id, name, st)
-            if ok:
-                self._transition(st, STATE_RECOVERING, server_id, name, "指令已发送，等待恢复")
-            else:
-                # 未能执行动作，退回 down 等下轮
-                st["state"] = STATE_DOWN
-
-    def run_once(self) -> Dict[str, Any]:
-        """执行一轮检测，返回本轮摘要。"""
+    def run_once(self):
         self.api.ensure_login()
+        servers = [s for s in self.config["servers"] if s.get("enabled", True)]
 
-        servers = [s for s in self.config.get("servers", []) if s.get("enabled", True)]
-
-        # 未配置服务器时自动发现
+        # 一台都没配就自动发现
         if not servers:
-            discovered = self.api.list_hosts()
-            for h in discovered:
-                hid = str(h.get("id", "")).strip()
-                if hid and not any(str(s.get("id")) == hid for s in self.config["servers"]):
-                    self.config["servers"].append({
-                        "id": hid,
-                        "name": h.get("name") or h.get("product_name") or f"host-{hid}",
-                        "ip": h.get("ip", "-"),
-                        "enabled": True,
-                    })
-            servers = [s for s in self.config.get("servers", []) if s.get("enabled", True)]
-            logging.info("自动发现 %s 台服务器", len(servers))
+            self.discover()
+            servers = [s for s in self.config["servers"] if s.get("enabled", True)]
 
-        for server in servers:
+        for s in servers:
             try:
-                self.check_server(server)
-            except Exception as e:
-                logging.exception("检测服务器 %s 出错：%s", server.get("id"), e)
+                self.check_server(s)
+            except Exception:
+                log.exception("检测服务器 %s 出错", s.get("id"))
 
         self.config["last_run"] = now_iso()
-        return {
-            "last_run": self.config["last_run"],
-            "total": len(servers),
-        }
+        return {"last_run": self.config["last_run"], "total": len(servers)}
+
+    def discover(self):
+        """从账户拉取主机并合并进配置，返回新增数量。"""
+        self.api.ensure_login()
+        known = {str(s.get("id")) for s in self.config["servers"]}
+        added = 0
+        for h in self.api.list_hosts():
+            hid = str(h.get("id", "")).strip()
+            if hid and hid not in known:
+                self.config["servers"].append({
+                    "id": hid,
+                    "name": h.get("name") or h.get("product_name") or f"host-{hid}",
+                    "ip": h.get("ip", "-"), "enabled": True,
+                })
+                known.add(hid)
+                added += 1
+        if added:
+            log.info("自动发现新增 %s 台服务器", added)
+        return added

@@ -1,45 +1,45 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-配置与运行状态持久化。
+配置与运行状态的持久化。
 
-- 在 Azure（设置了 AzureWebJobsStorage 且安装了 azure-storage-blob）时，
-  使用 Blob 存储保存单个 JSON（容器 zjmf-monitor / blob config.json）。
-- 本地运行时回退到当前目录的 monitor_data.json 文件。
+配置就是一个 JSON。存哪儿取决于环境，自动挑一个能用的后端：
 
-配置初始值来源（首次运行时）：环境变量 provider/settings，或本地默认值。
+  1. 显式指定文件      —— 设了 MONITOR_DATA_FILE，直接用本地文件（本地运行走这条）。
+  2. Azure Blob 存储   —— 装了 azure-storage-blob 且有连接串（AzureWebJobsStorage
+                          或 MONITOR_BLOB_CONNECTION）。这是真正 Serverless 的正道：
+                          实例随时被回收、文件系统随时清空也不丢状态。
+  3. 本地文件回退      —— 上面都不满足，就写 $HOME/data 或当前目录。
+
+首次运行的默认值来自环境变量。所有读写都过一把进程内锁，够用了。
 """
 
 import os
 import json
 import logging
 import threading
-from typing import Any, Dict
 
-_LOCAL_FILE = os.environ.get("MONITOR_DATA_FILE", "monitor_data.json")
-_CONTAINER = "zjmf-monitor"
-_BLOB = "config.json"
-_lock = threading.Lock()
+log = logging.getLogger("state")
+_lock = threading.RLock()
 
 
-def _default_config() -> Dict[str, Any]:
+def _defaults():
+    env = os.environ.get
     return {
         "provider": {
-            "base_url": os.environ.get("ZJMF_BASE_URL", "https://www.heyunidc.cn"),
-            "account": os.environ.get("ZJMF_ACCOUNT", ""),
-            "api_key": os.environ.get("ZJMF_API_KEY", ""),
+            "base_url": env("ZJMF_BASE_URL", "https://www.heyunidc.cn"),
+            "account": env("ZJMF_ACCOUNT", ""),
+            "api_key": env("ZJMF_API_KEY", ""),
         },
         "settings": {
-            "suspect_threshold": int(os.environ.get("ZJMF_SUSPECT_THRESHOLD", "3")),
-            "reboot_cooldown": int(os.environ.get("ZJMF_REBOOT_COOLDOWN", "600")),
-            "recover_timeout": int(os.environ.get("ZJMF_RECOVER_TIMEOUT", "300")),
-            "reboot_limit": int(os.environ.get("ZJMF_REBOOT_LIMIT", "5")),
-            "reboot_limit_window": os.environ.get("ZJMF_REBOOT_LIMIT_WINDOW", "hour"),
-            "action": os.environ.get("ZJMF_ACTION", "on"),  # on / hard_reboot
-            "dry_run": os.environ.get("ZJMF_DRY_RUN", "false").lower() == "true",
-            "webhook_url": os.environ.get("ZJMF_WEBHOOK_URL", ""),
-            "webhook_type": os.environ.get("ZJMF_WEBHOOK_TYPE", "custom"),
+            "suspect_threshold": int(env("ZJMF_SUSPECT_THRESHOLD", "3")),
+            "reboot_cooldown": int(env("ZJMF_REBOOT_COOLDOWN", "600")),
+            "recover_timeout": int(env("ZJMF_RECOVER_TIMEOUT", "300")),
+            "reboot_limit": int(env("ZJMF_REBOOT_LIMIT", "5")),
+            "reboot_limit_window": env("ZJMF_REBOOT_LIMIT_WINDOW", "hour"),
+            "action": env("ZJMF_ACTION", "on"),
+            "dry_run": env("ZJMF_DRY_RUN", "false").lower() == "true",
+            "webhook_url": env("ZJMF_WEBHOOK_URL", ""),
+            "webhook_type": env("ZJMF_WEBHOOK_TYPE", "custom"),
         },
         "servers": [],
         "state": {},
@@ -47,86 +47,9 @@ def _default_config() -> Dict[str, Any]:
     }
 
 
-def _blob_client():
-    """返回 (BlobClient) 或 None（不可用时）。"""
-    conn = os.environ.get("AzureWebJobsStorage") or os.environ.get("STORAGE_CONNECTION_STRING")
-    if not conn or conn == "UseDevelopmentStorage=true" and not os.environ.get("USE_AZURITE"):
-        # 明确未配置真实存储时使用本地文件
-        if not conn:
-            return None
-    try:
-        from azure.storage.blob import BlobServiceClient
-    except Exception:
-        logging.debug("azure-storage-blob 未安装，使用本地文件存储")
-        return None
-    try:
-        svc = BlobServiceClient.from_connection_string(conn)
-        container = svc.get_container_client(_CONTAINER)
-        try:
-            container.create_container()
-        except Exception:
-            pass  # 已存在
-        return container.get_blob_client(_BLOB)
-    except Exception as e:
-        logging.warning("初始化 Blob 存储失败，回退本地文件：%s", e)
-        return None
-
-
-def load_config() -> Dict[str, Any]:
-    with _lock:
-        blob = _blob_client()
-        if blob is not None:
-            try:
-                if blob.exists():
-                    raw = blob.download_blob().readall()
-                    cfg = json.loads(raw.decode("utf-8"))
-                    return _merge_defaults(cfg)
-            except Exception as e:
-                logging.warning("读取 Blob 配置失败：%s", e)
-            cfg = _default_config()
-            _save_blob(blob, cfg)
-            return cfg
-
-        # 本地文件
-        if os.path.exists(_LOCAL_FILE):
-            try:
-                with open(_LOCAL_FILE, "r", encoding="utf-8") as f:
-                    return _merge_defaults(json.load(f))
-            except Exception as e:
-                logging.warning("读取本地配置失败，使用默认：%s", e)
-        cfg = _default_config()
-        _save_local(cfg)
-        return cfg
-
-
-def save_config(cfg: Dict[str, Any]):
-    with _lock:
-        blob = _blob_client()
-        if blob is not None:
-            _save_blob(blob, cfg)
-        else:
-            _save_local(cfg)
-
-
-def _save_blob(blob, cfg: Dict[str, Any]):
-    try:
-        blob.upload_blob(json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"),
-                         overwrite=True)
-    except Exception as e:
-        logging.error("写入 Blob 配置失败：%s", e)
-
-
-def _save_local(cfg: Dict[str, Any]):
-    try:
-        with open(_LOCAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error("写入本地配置失败：%s", e)
-
-
-def _merge_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """确保关键字段存在，并用环境变量补齐空的凭据。"""
-    base = _default_config()
+def _merge_defaults(cfg):
+    """补齐缺失字段，并用环境变量填上空着的凭据（方便只在云端配环境变量）。"""
+    base = _defaults()
     cfg.setdefault("provider", {})
     for k, v in base["provider"].items():
         if not cfg["provider"].get(k):
@@ -134,7 +57,120 @@ def _merge_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("settings", {})
     for k, v in base["settings"].items():
         cfg["settings"].setdefault(k, v)
-    cfg.setdefault("servers", [])
+    for k in ("servers", "events"):
+        cfg.setdefault(k, [])
     cfg.setdefault("state", {})
-    cfg.setdefault("events", [])
     return cfg
+
+
+class _FileStore:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                log.warning("读取配置失败，用默认值: %s", e)
+        return None
+
+    def save(self, cfg):
+        # 先写临时文件再替换，避免写一半崩了留个坏文件
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+
+
+class _BlobStore:
+    def __init__(self, conn, container, blob):
+        from azure.storage.blob import BlobServiceClient  # 延迟导入，缺包时才报错
+        svc = BlobServiceClient.from_connection_string(conn)
+        try:
+            svc.create_container(container)
+        except Exception:
+            pass  # 已存在
+        self.client = svc.get_blob_client(container, blob)
+
+    def load(self):
+        from azure.core.exceptions import ResourceNotFoundError
+        try:
+            raw = self.client.download_blob().readall()
+        except ResourceNotFoundError:
+            return None
+        except Exception as e:
+            log.warning("读取 Blob 状态失败，用默认值: %s", e)
+            return None
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            log.warning("Blob 内容不是合法 JSON: %s", e)
+            return None
+
+    def save(self, cfg):
+        self.client.upload_blob(
+            json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"),
+            overwrite=True,
+        )
+
+
+def _build_store():
+    # 1. 显式文件优先
+    explicit = os.environ.get("MONITOR_DATA_FILE")
+    if explicit:
+        return _FileStore(explicit)
+
+    # 2. 有连接串就试 Blob（Serverless 首选）
+    conn = os.environ.get("MONITOR_BLOB_CONNECTION") or os.environ.get("AzureWebJobsStorage")
+    if conn and "UseDevelopmentStorage" not in conn:
+        try:
+            store = _BlobStore(
+                conn,
+                os.environ.get("MONITOR_BLOB_CONTAINER", "monitor"),
+                os.environ.get("MONITOR_BLOB_NAME", "monitor_data.json"),
+            )
+            log.info("状态持久化: Azure Blob")
+            return store
+        except Exception as e:
+            log.warning("Blob 存储不可用（%s），回退到本地文件", e)
+
+    # 3. 本地文件回退
+    home = os.environ.get("HOME")
+    if home and os.path.isdir(home):
+        data_dir = os.path.join(home, "data")
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            return _FileStore(os.path.join(data_dir, "monitor_data.json"))
+        except Exception:
+            pass
+    return _FileStore("monitor_data.json")
+
+
+_store = None
+
+
+def _get_store():
+    global _store
+    if _store is None:
+        _store = _build_store()
+    return _store
+
+
+def load_config():
+    with _lock:
+        cfg = _get_store().load()
+        if cfg is None:
+            cfg = _defaults()
+            _get_store().save(cfg)
+            return cfg
+        return _merge_defaults(cfg)
+
+
+def save_config(cfg):
+    with _lock:
+        try:
+            _get_store().save(cfg)
+        except Exception as e:
+            log.error("保存配置失败: %s", e)
