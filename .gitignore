@@ -1,0 +1,16 @@
+# 本地敏感配置
+local.settings.json
+monitor_data.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Azure Functions
+.python_packages/
+bin/
+obj/
+.vscode/

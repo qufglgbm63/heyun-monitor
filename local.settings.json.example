@@ -1,0 +1,24 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "ADMIN_TOKEN": "改成你的管理后台密码",
+
+    "ZJMF_BASE_URL": "https://www.heyunidc.cn",
+    "ZJMF_ACCOUNT": "你的账号(手机号或邮箱)",
+    "ZJMF_API_KEY": "你的API密钥",
+
+    "ZJMF_ACTION": "on",
+    "ZJMF_CRON": "0 */10 * * * *",
+    "ZJMF_SUSPECT_THRESHOLD": "3",
+    "ZJMF_REBOOT_COOLDOWN": "600",
+    "ZJMF_RECOVER_TIMEOUT": "300",
+    "ZJMF_REBOOT_LIMIT": "5",
+    "ZJMF_REBOOT_LIMIT_WINDOW": "hour",
+    "ZJMF_DRY_RUN": "false",
+    "ZJMF_WEBHOOK_TYPE": "custom",
+    "ZJMF_WEBHOOK_URL": ""
+  }
+}
